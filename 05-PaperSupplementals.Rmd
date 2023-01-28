@@ -1,0 +1,1073 @@
+---
+title: "Geographic clustering of travel-acquired infections in Ontario, Canada, 2008-2020 - Supplemental Figures"
+author: "Vinyas Harish et al. PLOS Global Public Health 2023"
+date: "27/01/2023"
+output: html_document
+---
+
+```{r, Setup workspace}
+rm(list = ls())
+
+#Data Manipulation
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(magrittr)
+
+#Plotting
+library(ggpubr)
+library(scales)
+
+#Mapping 
+library(tmap)
+library(sf)
+library(sp)
+library(spdep)
+library(raster)
+library(rgdal)
+library(RColorBrewer)
+
+#Bayesian modelling
+library(INLA)
+
+#For better reproducibility of INLA results
+set.seed(8272021)
+
+#Load in data 
+TropMed <- read.csv("PATH/TropicalDiseases-Updated-Final.csv") 
+
+#Count null FSAs
+table(TropMed$patient_fsa=="NUL") 
+
+#Minor cleaning, dropping postal codes for now since shouldn't be doing any analysis with it 
+TropMed <- TropMed %>% filter(patient_fsa!="NUL") %>%
+                       mutate(age_cat = case_when(age_cat=="a.< 5" ~ "< 5 yrs",
+                                                  age_cat=="c.5-<12 years" ~ "5-11 yrs",
+                                                  age_cat=="d.12-<18 years" ~ "12-17 yrs",
+                                                  age_cat=="e.18-<35 years" ~ "18-34 yrs",
+                                                  age_cat=="f.35-<55 years" ~ "35-54 yrs",
+                                                  age_cat=="g.55-<75 years" ~ "55-74 yrs",
+                                                  age_cat=="h.75+ years" ~ "75+ yrs",
+                                                  age_cat=="i.Unknown" ~ "Unknown"))
+
+#Other changes that don't work as nicely in a pipe 
+TropMed$sample_id <- TropMed$sample_id %>% str_remove("Tropical_")
+
+#Clean up the new, non-standard year formatting...
+TropMed <- TropMed %>% mutate(tempDay = substr(login_date,1,2),
+                              tempMon = substr(login_date,3,5),
+                              tempYr = substr(login_date,6,10)) %>%
+            mutate(tempMon = case_when(tempMon == "jan"~"01",
+                                       tempMon == "feb"~"02",
+                                       tempMon == "mar"~"03",
+                                       tempMon == "apr"~"04",
+                                       tempMon == "may"~"05",
+                                       tempMon == "jun"~"06",
+                                       tempMon == "jul"~"07",
+                                       tempMon == "aug"~"08",
+                                       tempMon == "sep"~"09",
+                                       tempMon == "oct"~"10",
+                                       tempMon == "nov"~"11",
+                                       tempMon == "dec"~"12")) %>%
+          mutate(tempDate = paste(tempDay, tempMon, tempYr, sep = "-")) %>%
+          mutate(login_date = tempDate) %>%
+          dplyr::select(-c(tempDate, tempDay, tempMon, tempYr))
+
+TropMed$login_date <- as.Date(TropMed$login_date, format = "%d-%m-%Y")
+TropMed <- TropMed %>% mutate(login_year = year(login_date))
+
+Arboviruses  <- read.csv("PATH/Arboviruses-Cleaned.csv")
+Enteric <- read.csv("PATH/Enteric-Cleaned.csv")
+Malaria <- read.csv("PATH/Malaria-Cleaned.csv")
+Pooled <- read.csv("PATH/Pooled-Cleaned.csv")
+Census <- read.csv("PATH/CENSUS-16-FSA-CLEAN.csv") %>%
+          dplyr::select(-X)
+MinDriveTimes <- read.csv("PATH/MinDriveTimes.csv")
+
+#Trim zipcodes to postal codes
+Arboviruses %<>% dplyr::rename(FSA=patient_fsa)
+
+Enteric %<>% dplyr::rename(FSA=patient_fsa)
+
+Malaria %<>% dplyr::rename(FSA=patient_fsa)
+
+Pooled %<>% dplyr::rename(FSA=patient_fsa)
+
+#Create additional census category
+Census$ImmigrationStatus_Between01And16 <- Census$ImmigrationStatus_Between01And10 + Census$ImmigrationStatus_Between11And16 
+
+#Load in shapefiles 
+ProvBoundaries <- shapefile("PATH/ProvincialBoundaries.shp")
+CMAs <- shapefile("PATH/CMAs.shp")
+FSAs <- shapefile("PATH/FSAs.shp")
+DAs <-  shapefile("PATH/DAs.shp")
+
+#Subselect boundary files 
+ON_Boundary <- subset(ProvBoundaries, PRENAME=="Ontario") 
+ON_FSAs <- subset(FSAs, PRNAME=="Ontario")
+ON_DAs <- subset(DAs, PRNAME=="Ontario")
+TO <- subset(CMAs, CMANAME=="Toronto")
+
+GTA_FSAs <- raster::intersect(TO, ON_FSAs)
+
+#Subselect census data 
+ON_FSAs_Names <- ON_FSAs$CFSAUID
+GTA_FSAs_Names <- GTA_FSAs$CFSAUID
+Census_ON <- Census[Census$FSA %in% ON_FSAs_Names,]
+Census_GTA <- Census[Census$FSA %in% GTA_FSAs_Names,]
+
+# Process counts for Figure 1 
+YearlyTally_Arboviruses_ON <- Arboviruses %>% group_by(FSA) %>% 
+                                              filter(FSA %in% ON_FSAs_Names) %>%
+                                              ungroup() %>%
+                                              group_by(login_year) %>% 
+                                              tally() %>% 
+                                              rename(n_Arbovirus = n)
+
+YearlyTally_Enteric_ON <- Enteric %>% group_by(FSA) %>% 
+                                      filter(FSA %in% ON_FSAs_Names) %>%
+                                      ungroup() %>%
+                                      group_by(login_year) %>% 
+                                      tally() %>% 
+                                      rename(n_Enteric = n) %>%
+                                      add_row(login_year = 2008, n_Enteric = NA) %>%
+                                      arrange(login_year)
+
+YearlyTally_Malaria_ON <- Malaria %>% group_by(FSA) %>% 
+                                      filter(FSA %in% ON_FSAs_Names) %>%
+                                      ungroup() %>%
+                                      group_by(login_year) %>% 
+                                      tally() %>% 
+                                      rename(n_Malaria = n) %>%
+                                      add_row(login_year = 2008, n_Malaria = NA) %>%
+                                      arrange(login_year)
+
+YearlyTally_Pooled_ON <- Pooled %>% group_by(FSA) %>% 
+                                    filter(FSA %in% ON_FSAs_Names) %>%
+                                    ungroup() %>%
+                                    group_by(login_year) %>% 
+                                    tally() %>% 
+                                    rename(n_Pooled = n)
+
+YearlyTally_All_ON <- cbind(YearlyTally_Arboviruses_ON, YearlyTally_Enteric_ON, YearlyTally_Malaria_ON, YearlyTally_Pooled_ON) %>%
+                      dplyr::select(c(1,2,4,6,8)) %>%
+                      pivot_longer(cols=starts_with("n_"), names_to="Disease", values_to="NumberOfCases") %>%
+                      mutate(Year=login_year,
+                             Disease=str_replace(Disease, pattern="n_", replacement = ""))
+
+table(Pooled$FSA %in% ON_FSAs_Names)
+
+# Process counts for spatial analyses 
+  ## First, turn raw test-level data into counts of infections by FSA
+  ## Next, left join on FSA to add in drive time data 
+  ## Next, left join on FSA to add in census data 
+  ## Then, replace missing values with 0s 
+  ## Finally, merge to add the spatial polygons
+   
+  ## Arboviruses 
+TenYrTally_Arboviruses_ON <- Arboviruses %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Arboviruses_ON <- merge(ON_FSAs@data, TenYrTally_Arboviruses_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                             rename(FSA=CFSAUID)
+TenYrTally_Arboviruses_ON <- left_join(TenYrTally_Arboviruses_ON, MinDriveTimes, by="FSA")
+TenYrTally_Arboviruses_ON <- left_join(TenYrTally_Arboviruses_ON, Census_ON, by="FSA")
+TenYrTally_Arboviruses_ON <- merge(ON_FSAs, TenYrTally_Arboviruses_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Arboviruses_ON$n[is.na(TenYrTally_Arboviruses_ON$n)] <- 0
+
+ ## Enteric Fever 
+TenYrTally_Enteric_ON <- Enteric %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Enteric_ON <- merge(ON_FSAs@data, TenYrTally_Enteric_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                         rename(FSA=CFSAUID)
+TenYrTally_Enteric_ON <- left_join(TenYrTally_Enteric_ON, MinDriveTimes, by="FSA")
+TenYrTally_Enteric_ON <- left_join(TenYrTally_Enteric_ON, Census_ON, by="FSA")
+TenYrTally_Enteric_ON <- merge(ON_FSAs, TenYrTally_Enteric_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Enteric_ON$n[is.na(TenYrTally_Enteric_ON$n)] <- 0
+
+  ## Malaria
+TenYrTally_Malaria_ON <- Malaria %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Malaria_ON <- merge(ON_FSAs@data, TenYrTally_Malaria_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                         rename(FSA=CFSAUID)
+TenYrTally_Malaria_ON <- left_join(TenYrTally_Malaria_ON, MinDriveTimes, by="FSA")
+TenYrTally_Malaria_ON <- left_join(TenYrTally_Malaria_ON, Census_ON, by="FSA")
+TenYrTally_Malaria_ON <- merge(ON_FSAs, TenYrTally_Malaria_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Malaria_ON$n[is.na(TenYrTally_Malaria_ON$n)] <- 0
+
+  ## Pooled
+TenYrTally_Pooled_ON <- Pooled %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Pooled_ON <- merge(ON_FSAs@data, TenYrTally_Pooled_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                        rename(FSA=CFSAUID)
+TenYrTally_Pooled_ON <- left_join(TenYrTally_Pooled_ON, MinDriveTimes, by="FSA")
+TenYrTally_Pooled_ON <- left_join(TenYrTally_Pooled_ON, Census_ON, by="FSA")
+TenYrTally_Pooled_ON <- merge(ON_FSAs, TenYrTally_Pooled_ON, by.x="CFSAUID", by.y="FSA", all=TRUE)
+TenYrTally_Pooled_ON$n[is.na(TenYrTally_Pooled_ON$n)] <- 0
+
+#Create spatial weights matrix that will be needed for Moran's and other calculations 
+
+##  poly2nb function builds a neighbours list based on regions with contiguous boundaries
+  ### Default is Queen as opposed to rook criteria 
+ON_NeighboursList <- poly2nb(ON_FSAs, row.names=ON_FSAs$CFSAUID, queen=TRUE)
+
+#Turn the neighbouhood into a spatial weights matrix, with row standardization 
+ON_SpatialWeightsMatrix <- nb2mat(ON_NeighboursList, style='W')
+
+# Turn the neighbouhood into a spatial list object 
+ON_SpatialWeightsList<-  nb2listw(ON_NeighboursList, style='W', zero.policy=TRUE)
+```
+
+Section 1 - Outcome definitions
+Table S1 - Time between tests for chik
+```{r, 1a - PCR}
+# Subset data by test type
+Chik_PCR <- TropMed %>% filter(test_targets == "Chik PCR" |
+                               test_targets == "Chikungunya PCR")
+
+chikPCRTestResults <- as.data.frame(table(Chik_PCR$test_result)) %>% rename(test_result=Var1)
+chikPCRTestsPerPt <- as.data.frame(table(Chik_PCR$patid)) %>% rename(patient_id=Var1)
+table(chikPCRTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleChikPCRTestsIDs <- chikPCRTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleChikPCR <- Chik_PCR %>% filter(patid %in% multipleChikPCRTestsIDs$patient_id) %>% group_by(patid)
+
+Chik_PCR_TimeBnTests <- multipleChikPCR %>%summarize(first_test= min(login_date), 
+                                                     last_test = max(login_date), 
+                                                     time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Chik_PCR_TimeBnTests$within14Days)
+table(Chik_PCR_TimeBnTests$within30Days)
+table(Chik_PCR_TimeBnTests$within60Days)
+table(Chik_PCR_TimeBnTests$within90Days)
+table(Chik_PCR_TimeBnTests$within180Days)
+table(Chik_PCR_TimeBnTests$within365Days)
+```
+
+```{r, 1b - IgM ELISA}
+# Subset data by test type
+Chik_IGM <- TropMed %>% filter(test_targets == "Chikungunya IgM EIA")
+
+chikIGMTestResults <- as.data.frame(table(Chik_IGM$test_result)) %>% rename(test_result=Var1)
+chikIGMTestsPerPt <- as.data.frame(table(Chik_IGM$patid)) %>% rename(patient_id=Var1)
+table(chikIGMTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleChikIGMTestsIDs <- chikIGMTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleChikIGM <- Chik_IGM %>% filter(patid %in% multipleChikIGMTestsIDs$patient_id) %>% group_by(patid)
+
+Chik_IGM_TimeBnTests <- multipleChikIGM %>%summarize(first_test= min(login_date), 
+                                                     last_test = max(login_date), 
+                                                     time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Chik_IGM_TimeBnTests$within14Days)
+table(Chik_IGM_TimeBnTests$within30Days)
+table(Chik_IGM_TimeBnTests$within60Days)
+table(Chik_IGM_TimeBnTests$within90Days)
+table(Chik_IGM_TimeBnTests$within180Days)
+table(Chik_IGM_TimeBnTests$within365Days)
+``` 
+
+Table S2 - Time between tests for dengue 
+```{r, 2a - PCR}
+# Subset data by test type
+Dengue_PCR <- TropMed %>% filter(test_targets == "Dengue PCR")
+
+DenguePCRTestResults <- as.data.frame(table(Dengue_PCR$test_result)) %>% rename(test_result=Var1)
+DenguePCRTestsPerPt <- as.data.frame(table(Dengue_PCR$patid)) %>% rename(patient_id=Var1)
+table(DenguePCRTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleDenguePCRTestsIDs <- DenguePCRTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleDenguePCR <- Dengue_PCR %>% filter(patid %in% multipleDenguePCRTestsIDs$patient_id) %>% group_by(patid)
+
+Dengue_PCR_TimeBnTests <- multipleDenguePCR %>%summarize(first_test= min(login_date), 
+                                                         last_test = max(login_date), 
+                                                         time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Dengue_PCR_TimeBnTests$within14Days)
+table(Dengue_PCR_TimeBnTests$within30Days)
+table(Dengue_PCR_TimeBnTests$within60Days)
+table(Dengue_PCR_TimeBnTests$within90Days)
+table(Dengue_PCR_TimeBnTests$within180Days)
+table(Dengue_PCR_TimeBnTests$within365Days)
+```
+
+```{r, 2b - IgM ELISA}
+# Subset data by test type
+Dengue_IGM <- TropMed %>% filter(test_targets == "Dengue IgM EIA")
+
+DengueIGMTestResults <- as.data.frame(table(Dengue_IGM$test_result)) %>% rename(test_result=Var1)
+DengueIGMTestsPerPt <- as.data.frame(table(Dengue_IGM$patid)) %>% rename(patient_id=Var1)
+table(DengueIGMTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleDengueIGMTestsIDs <- DengueIGMTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleDengueIGM <- Dengue_IGM %>% filter(patid %in% multipleDengueIGMTestsIDs$patient_id) %>% group_by(patid)
+
+Dengue_IGM_TimeBnTests <- multipleDengueIGM %>%summarize(first_test= min(login_date), 
+                                                     last_test = max(login_date), 
+                                                     time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Dengue_IGM_TimeBnTests$within14Days)
+table(Dengue_IGM_TimeBnTests$within30Days)
+table(Dengue_IGM_TimeBnTests$within60Days)
+table(Dengue_IGM_TimeBnTests$within90Days)
+table(Dengue_IGM_TimeBnTests$within180Days)
+table(Dengue_IGM_TimeBnTests$within365Days)
+```
+
+Table S3 - Time between tests for enteric fever
+```{r, 3 - Culture}
+Ent_Cult <- TropMed %>% filter(test_name == "CULTURE_ENT" |
+                               test_name == "CULTURE_ENT_REF")
+
+EntCultTestResults <- as.data.frame(table(Ent_Cult$test_result)) %>% rename(test_result=Var1)
+EntCultTestsPerPt <- as.data.frame(table(Ent_Cult$patid)) %>% rename(patient_id=Var1)
+table(EntCultTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleEntCultTestsIDs <- EntCultTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleEntCult <- Ent_Cult %>% filter(patid %in% multipleEntCultTestsIDs$patient_id) %>% group_by(patid)
+
+Ent_Cult_TimeBnTests <- multipleEntCult %>%summarize(first_test= min(login_date), 
+                                                     last_test = max(login_date), 
+                                                     time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Ent_Cult_TimeBnTests$within14Days)
+table(Ent_Cult_TimeBnTests$within30Days)
+table(Ent_Cult_TimeBnTests$within60Days)
+table(Ent_Cult_TimeBnTests$within90Days)
+table(Ent_Cult_TimeBnTests$within180Days)
+table(Ent_Cult_TimeBnTests$within365Days)
+```
+
+Table S4 - Time between tests for malaria
+```{r, 4a - Microscopy}
+Malaria_Micro <- TropMed %>% filter(test_name == "MALARIA_MIC")
+
+MalariaMicroTestResults <- as.data.frame(table(Malaria_Micro$test_result)) %>% rename(test_result=Var1)
+MalariaMicroTestsPerPt <- as.data.frame(table(Malaria_Micro$patid)) %>% rename(patient_id=Var1)
+table(MalariaMicroTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleMalariaMicroTestsIDs <- MalariaMicroTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleMalariaMicro <- Malaria_Micro %>% filter(patid %in% multipleMalariaMicroTestsIDs$patient_id) %>% group_by(patid)
+
+Malaria_Micro_TimeBnTests <- multipleMalariaMicro %>%summarize(first_test= min(login_date), 
+                                                               last_test = max(login_date), 
+                                                               time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Malaria_Micro_TimeBnTests$within14Days)
+table(Malaria_Micro_TimeBnTests$within30Days)
+table(Malaria_Micro_TimeBnTests$within60Days)
+table(Malaria_Micro_TimeBnTests$within90Days)
+table(Malaria_Micro_TimeBnTests$within180Days)
+table(Malaria_Micro_TimeBnTests$within365Days)
+```
+
+```{r, 4b - RDT/PCR}
+Malaria_PCR <- TropMed %>% filter(test_name == "MALARIA_ICT" |
+                                  test_name == "MALARIA_PCR" )
+
+MalariaPCRTestResults <- as.data.frame(table(Malaria_PCR$test_result)) %>% rename(test_result=Var1)
+MalariaPCRTestsPerPt <- as.data.frame(table(Malaria_PCR$patid)) %>% rename(patient_id=Var1)
+table(MalariaPCRTestsPerPt$Freq)
+
+# Of the people who received multiple tests, what's the duration they got the tests?
+multipleMalariaPCRTestsIDs <- MalariaPCRTestsPerPt %>% filter(Freq > 1) %>% dplyr::select(patient_id) 
+multipleMalariaPCR <- Malaria_PCR %>% filter(patid %in% multipleMalariaPCRTestsIDs$patient_id) %>% group_by(patid)
+
+Malaria_PCR_TimeBnTests <- multipleMalariaPCR %>%summarize(first_test= min(login_date), 
+                                                           last_test = max(login_date), 
+                                                           time_bn_tests = last_test - first_test) %>%
+                                           mutate(within14Days = case_when(time_bn_tests > 14 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within30Days = case_when(time_bn_tests > 30 ~ 0,
+                                                                           TRUE ~ 1)) %>%
+                                           mutate(within60Days = case_when(time_bn_tests > 60 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within90Days = case_when(time_bn_tests > 90 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within180Days = case_when(time_bn_tests > 180 ~ 0,
+                                                                           TRUE ~ 1)) %>% 
+                                           mutate(within365Days = case_when(time_bn_tests > 365 ~ 0,
+                                                                           TRUE ~ 1))
+# Create table to summarize results
+table(Malaria_PCR_TimeBnTests$within14Days)
+table(Malaria_PCR_TimeBnTests$within30Days)
+table(Malaria_PCR_TimeBnTests$within60Days)
+table(Malaria_PCR_TimeBnTests$within90Days)
+table(Malaria_PCR_TimeBnTests$within180Days)
+table(Malaria_PCR_TimeBnTests$within365Days)
+```
+
+Section 2 - Disaggregated analyses:
+S1 - ON-wide maps of each disease in count form
+```{r, S1a - Arboviruses}
+palette_arboviruses <- brewer.pal(n = 7, name = "Blues")
+palette_arboviruses <- c("#FFFFFF", palette_arboviruses)
+
+tmap_mode("plot")+
+tm_shape(ON_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_fill("n", title = "Arbovirus cases, 2008-2020", palette = palette_arboviruses, breaks=c(0,1,5,10,20,30,40),
+         labels = c("0", "1-5", "5-10", "10-20","20-30", "30-40"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S1b - Malaria}
+palette_malaria <- brewer.pal(n = 9, name = "Reds")
+palette_malaria <- c("#FFFFFF", palette_malaria)
+
+tmap_mode("plot")+
+tm_shape(ON_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_fill("n", title = "Malaria cases, 2009-2020", palette = palette_malaria, breaks=c(0,1,5,10,20,30,40,50,60,70),
+        labels = c("0", "1-5", "5-10", "10-20","20-30", "30-40", "40-50", "50-60", "60-70"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S1c - Enteric Fever} 
+palette_enteric <- brewer.pal(n = 9, name = "Greens")
+palette_enteric <- c("#FFFFFF", palette_enteric)
+
+tmap_mode("plot")+
+tm_shape(ON_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_fill("n", title = "Enteric fever cases, 2009-2020", palette = palette_enteric, breaks = c(0, 1,10, 20,40,60,80,100,120,140),
+         labels = c("0", "1-10", "10-20", "20-40","40-60", "60-80", "80-100", "100-120", "120-140"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S1d- Pooled cases}
+palette_pooled <- brewer.pal(n = 9, name = "YlOrBr")
+palette_pooled <- c("#FFFFFF", palette_pooled)
+
+tmap_mode("plot")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_fill("n", title = "Pooled cases, 2008-2020", palette = palette_pooled, breaks = c(0, 1, 5, 10, 25,50,100,150,200,250), 
+        labels = c("0", "1-5", "5-10", "10-25", "25-50","50-100", "100-150", "150-200", "200-250"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+S2 - BHM-SIRs and incidence Levels for Arboviruses across ON
+```{r, Calculate BHM SIRS and assign incidence levels}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs 
+ON_Population <- sum(Census_ON$Population)
+ON_TotalArbovirusCases <- sum(TenYrTally_Arboviruses_ON$n)
+ON_ArbovirusRate <- ON_TotalArbovirusCases/ON_Population
+
+TenYrTally_Arboviruses_ON@data <- TenYrTally_Arboviruses_ON@data %>% mutate(ExpectedCases = ON_ArbovirusRate * Population) %>%
+                                                                     dplyr::rename(ObservedCases = n) %>%
+                                                                     mutate(SIR = ObservedCases/ExpectedCases)
+
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_ON.adj", ON_NeighboursList)
+INLA_nb <- inla.read.graph(filename = "INLA_ON.adj")
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Arboviruses_ON@data)
+v_IndexVec <- 1:nrow(TenYrTally_Arboviruses_ON@data)
+
+formula <- ObservedCases ~ + f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                             f(v_IndexVec, model = "iid")
+
+INLA_Results <- inla(formula,family = "zeroinflatedpoisson2", data = TenYrTally_Arboviruses_ON@data, E = ExpectedCases, 
+                     control.predictor = list(compute = TRUE),
+                     control.compute = list(waic = TRUE))
+
+#Pull out the relative risk, upper limit, and lower limit from the INLA estimates 
+TenYrTally_Arboviruses_ON@data$bhmSIR <- INLA_Results$summary.fitted.values[, "mean"]
+TenYrTally_Arboviruses_ON@data$LL <- INLA_Results$summary.fitted.values[, "0.025quant"]
+TenYrTally_Arboviruses_ON@data$UL <- INLA_Results$summary.fitted.values[, "0.975quant"]
+
+
+TenYrTally_Arboviruses_ON@data <- TenYrTally_Arboviruses_ON@data %>% mutate(IncidenceCat = case_when(LL > 2 & UL > 2 ~ "high-incidence",
+                                                                                                     LL < 1 & UL < 1 ~ "low-incidence",
+                                                                                                     TRUE ~ "moderate-incidence")) 
+
+TenYrTally_Arboviruses_ON@data$IncidenceCat <- factor(TenYrTally_Arboviruses_ON@data$IncidenceCat,
+                                                      levels=c("low-incidence","moderate-incidence","high-incidence")) 
+
+```
+
+```{r, S2a - ON-wide map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_borders(col="black")+
+tm_fill("bhmSIR", title = "BHM-smoothed Arbovirus SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S2b - GTA map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_fill("bhmSIR", title = "BHM-smoothed Arbovirus SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S2c - ON-wide map of arbovirus incidence levels}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_borders(col="black")+
+tm_fill("IncidenceCat", title = "Arbovirus incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S2d - GTA map of arbovirus incidence levels}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_fill("IncidenceCat", title = "Arbovirus incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+S3 - Census boxplots for Arboviruses across ON
+```{r, S3a-f - Boxplots of key census variables across ON}
+ON_CompareClusters_Arboviruses  <- TenYrTally_Arboviruses_ON@data %>% 
+                                   dplyr::select(IncidenceCat, ImmigrationStatus_Immigrants, ImmigrationStatus_Between01And16,
+                                                 HouseholdAfterTaxIncome_Value, 
+                                                 Education_NoCertDipDeg, Education_Uni_CertDipAboveBSC, KnowledgeOfLanguage_NoEnglishNorFrench,
+                                                 TransportToWork_PublicTransit)
+
+my_comparisons <- list( c("low-incidence","high-incidence"))
+
+#Comparing based on immigration 
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "ImmigrationStatus_Immigrants", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrant", xlab = "Cluster Type") + rremove("legend") +
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "ImmigrationStatus_Between01And16", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrated between 2001-2016", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on income 
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "HouseholdAfterTaxIncome_Value", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "Household After-tax Income", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 150000)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "Education_NoCertDipDeg", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% no certificate, diploma, degree", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "Education_Uni_CertDipAboveBSC", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% university certificiate/diploma above BSc", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+#Comparing based on language
+ggboxplot(ON_CompareClusters_Arboviruses, x = "IncidenceCat", y = "KnowledgeOfLanguage_NoEnglishNorFrench", 
+           color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+           order = c("low-incidence", "moderate-incidence", "high-incidence"),
+           ylab = "% no knowledge of English/French", xlab = "Cluster Type") + rremove("legend")+
+           stat_compare_means(comparisons = my_comparisons) + 
+           stat_compare_means(label.y = 35)  
+
+```
+
+S4 - BHM-SIRs and incidence levels for Enteric Fever across ON
+```{r, Calculate BHM SIRS and assign incidence levels}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs 
+ON_Population <- sum(Census_ON$Population)
+ON_TotalEntericCases <- sum(TenYrTally_Enteric_ON$n)
+ON_EntericRate <- ON_TotalEntericCases/ON_Population
+
+TenYrTally_Enteric_ON@data <- TenYrTally_Enteric_ON@data %>% mutate(ExpectedCases = ON_EntericRate * Population) %>%
+                                                             dplyr::rename(ObservedCases = n) %>%
+                                                             mutate(SIR = ObservedCases/ExpectedCases)
+
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_ON.adj", ON_NeighboursList)
+INLA_nb <- inla.read.graph(filename = "INLA_ON.adj")
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Enteric_ON@data)
+v_IndexVec <- 1:nrow(TenYrTally_Enteric_ON@data)
+
+formula <- ObservedCases ~ + f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                             f(v_IndexVec, model = "iid")
+
+INLA_Results <- inla(formula,family = "zeroinflatedpoisson2", data = TenYrTally_Enteric_ON@data, E = ExpectedCases, 
+                     control.predictor = list(compute = TRUE),
+                     control.compute = list(waic = TRUE))
+
+#Pull out the relative risk, upper limit, and lower limit from the INLA estimates 
+TenYrTally_Enteric_ON@data$bhmSIR <- INLA_Results$summary.fitted.values[, "mean"]
+TenYrTally_Enteric_ON@data$LL <- INLA_Results$summary.fitted.values[, "0.025quant"]
+TenYrTally_Enteric_ON@data$UL <- INLA_Results$summary.fitted.values[, "0.975quant"]
+
+
+TenYrTally_Enteric_ON@data <- TenYrTally_Enteric_ON@data %>% mutate(IncidenceCat = case_when(LL > 2 & UL > 2 ~ "high-incidence",
+                                                                                             LL < 1 & UL < 1 ~ "low-incidence",
+                                                                                             TRUE ~ "moderate-incidence")) 
+
+TenYrTally_Enteric_ON@data$IncidenceCat <- factor(TenYrTally_Enteric_ON@data$IncidenceCat, levels=c("low-incidence","moderate-incidence","high-incidence")) 
+```
+
+```{r, S4a - ON-wide map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_borders(col="black")+
+tm_fill("bhmSIR", title = "BHM-smoothed Enteric fever SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5, 10, 15))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S4b - GTA map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_fill("bhmSIR", title = "BHM-smoothed Enteric fever SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5, 10, 15))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S4c - ON-wide map of enteric incidence levels}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_borders(col="black")+
+tm_fill("IncidenceCat", title = "Enteric fever incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S4d - GTA map of enteric incidence levels}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_fill("IncidenceCat", title = "Enteric fever incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+S5 - Census boxplots for Enteric Fever across ON
+```{r, S5a-f - Boxplots of key census variables across ON}
+ON_CompareClusters_Enteric  <- TenYrTally_Enteric_ON@data %>% 
+                               dplyr::select(IncidenceCat, ImmigrationStatus_Immigrants, ImmigrationStatus_Between01And16,
+                                             HouseholdAfterTaxIncome_Value, Education_NoCertDipDeg, Education_Uni_CertDipAboveBSC,
+                                             KnowledgeOfLanguage_NoEnglishNorFrench,TransportToWork_PublicTransit)
+
+my_comparisons <- list( c("low-incidence","high-incidence"))
+
+#Comparing based on immigration 
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "ImmigrationStatus_Immigrants", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrant", xlab = "Cluster Type") + rremove("legend") +
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "ImmigrationStatus_Between01And16", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrated between 2001-2016", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on income 
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "HouseholdAfterTaxIncome_Value", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "Household After-tax Income", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 150000)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "Education_NoCertDipDeg", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% no certificate, diploma, degree", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "Education_Uni_CertDipAboveBSC", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% university certificiate/diploma above BSc", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+#Comparing based on language
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "KnowledgeOfLanguage_NoEnglishNorFrench", 
+           color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+           order = c("low-incidence", "moderate-incidence", "high-incidence"),
+           ylab = "% no knowledge of English/French", xlab = "Cluster Type") + rremove("legend")+
+           stat_compare_means(comparisons = my_comparisons) + 
+           stat_compare_means(label.y = 35)  
+
+```
+
+S6 - BHM-SIRs and incidence levels for Malaria across ON
+```{r, Calculate BHM SIRS and assign incidence levels}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs 
+ON_Population <- sum(Census_ON$Population)
+ON_TotalMalariaCases <- sum(TenYrTally_Malaria_ON$n)
+ON_MalariaRate <- ON_TotalMalariaCases/ON_Population
+
+TenYrTally_Malaria_ON@data <- TenYrTally_Malaria_ON@data %>% mutate(ExpectedCases = ON_MalariaRate * Population) %>%
+                                                             dplyr::rename(ObservedCases = n) %>%
+                                                             mutate(SIR = ObservedCases/ExpectedCases)
+
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_ON.adj", ON_NeighboursList)
+INLA_nb <- inla.read.graph(filename = "INLA_ON.adj")
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Malaria_ON@data)
+v_IndexVec <- 1:nrow(TenYrTally_Malaria_ON@data)
+
+formula <- ObservedCases ~ + f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                             f(v_IndexVec, model = "iid")
+
+INLA_Results <- inla(formula,family = "zeroinflatedpoisson2", data = TenYrTally_Malaria_ON@data, E = ExpectedCases, 
+                     control.predictor = list(compute = TRUE),
+                     control.compute = list(waic = TRUE))
+
+#Pull out the relative risk, upper limit, and lower limit from the INLA estimates 
+TenYrTally_Malaria_ON@data$bhmSIR <- INLA_Results$summary.fitted.values[, "mean"]
+TenYrTally_Malaria_ON@data$LL <- INLA_Results$summary.fitted.values[, "0.025quant"]
+TenYrTally_Malaria_ON@data$UL <- INLA_Results$summary.fitted.values[, "0.975quant"]
+
+
+TenYrTally_Malaria_ON@data <- TenYrTally_Malaria_ON@data %>% mutate(IncidenceCat = case_when(LL > 2 & UL > 2 ~ "high-incidence",
+                                                                                             LL < 1 & UL < 1 ~ "low-incidence",
+                                                                                             TRUE ~ "moderate-incidence")) 
+
+TenYrTally_Malaria_ON@data$IncidenceCat <- factor(TenYrTally_Malaria_ON@data$IncidenceCat, levels=c("low-incidence","moderate-incidence","high-incidence")) 
+```
+
+```{r, S6a - ON-wide map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_borders(col="black")+
+tm_fill("bhmSIR", title = "BHM-smoothed Malaria SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5, 10, 15))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S6b - GTA map of BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_fill("bhmSIR", title = "BHM-smoothed Malaria SIRs", palette = "YlOrRd", breaks = c(0, 1, 2,3,4,5, 10, 15))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S6c - ON-wide map of malaria incidence levels}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_borders(col="black")+
+tm_fill("IncidenceCat", title = "Malaria-incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, S6d - GTA map of malaria incidence levels}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_fill("IncidenceCat", title = "Malaria-incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+S7 - Census boxplots for Malaria across ON
+```{r, S7a-f - Boxplots of key census variables across ON}
+ON_CompareClusters_Malaria  <- TenYrTally_Malaria_ON@data %>% 
+                               dplyr::select(IncidenceCat, ImmigrationStatus_Immigrants, HouseholdAfterTaxIncome_Value, 
+                                             Education_NoCertDipDeg, Education_Uni_CertDipAboveBSC, KnowledgeOfLanguage_NoEnglishNorFrench,
+                                             TransportToWork_PublicTransit)
+
+my_comparisons <- list( c("low-incidence","high-incidence"))
+
+#Comparing based on immigration 
+ggboxplot(ON_CompareClusters_Malaria, x = "IncidenceCat", y = "ImmigrationStatus_Immigrants", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrant", xlab = "Cluster Type") + rremove("legend") +
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+ggboxplot(ON_CompareClusters_Enteric, x = "IncidenceCat", y = "ImmigrationStatus_Between01And16", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrated between 2001-2016", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on income 
+ggboxplot(ON_CompareClusters_Malaria, x = "IncidenceCat", y = "HouseholdAfterTaxIncome_Value", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "Household After-tax Income", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 150000)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Malaria, x = "IncidenceCat", y = "Education_NoCertDipDeg", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% no certificate, diploma, degree", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters_Malaria, x = "IncidenceCat", y = "Education_Uni_CertDipAboveBSC", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% university certificiate/diploma above BSc", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+#Comparing based on language
+ggboxplot(ON_CompareClusters_Malaria, x = "IncidenceCat", y = "KnowledgeOfLanguage_NoEnglishNorFrench", 
+           color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+           order = c("low-incidence", "moderate-incidence", "high-incidence"),
+           ylab = "% no knowledge of English/French", xlab = "Cluster Type") + rremove("legend")+
+           stat_compare_means(comparisons = my_comparisons) + 
+           stat_compare_means(label.y = 35)  
+
+```
+
+Supplemental Tables:
+Table S1 - Global Moran's
+```{r, Raw case counts}
+# Interpreting Morans I statistic:
+  ## Perfectly dispersed = -1
+  ## Not dispersed at all (fully clustered) = 1
+  ## Random = 0
+
+# H0 = the data is randomly disbursed
+# HA = data is more spatially clustered than you would expect by chance alone
+
+# Arboviruses ( M1 = 0.4070292097, p < 2.2e-16)
+moran.test(TenYrTally_Arboviruses_ON$ObservedCases, ON_SpatialWeightsList)
+
+# Enteric ( M1 = 0.3465345508 , p = < 2.2e-16)
+moran.test(TenYrTally_Enteric_ON$ObservedCases, ON_SpatialWeightsList)
+
+# Malaria ( M1 = 0.3330814755, p = < 2.2e-16)
+moran.test(TenYrTally_Malaria_ON$ObservedCases, ON_SpatialWeightsList)
+
+# Pooled ( M1 = 0.3784245201, p = < 2.2e-16)
+TenYrTally_Pooled_ON@data <- TenYrTally_Pooled_ON@data %>% dplyr::rename(ObservedCases = n)
+moran.test(TenYrTally_Pooled_ON$ObservedCases, ON_SpatialWeightsList)
+```
+
+```{r, BHM SIRs}
+# Interpreting Morans I statistic:
+  ## Perfectly dispersed = -1
+  ## Not dispersed at all (fully clustered) = 1
+  ## Random = 0
+
+# H0 = the data is randomly disbursed
+# HA = data is more spatially clustered than you would expect by chance alone
+
+# Arbovirus SIRs ( M1 = 0.8581881539, p < 2.2e-16 )
+moran.test(TenYrTally_Arboviruses_ON$bhmSIR, ON_SpatialWeightsList)
+
+# Malaria SIRs ( M1 = 0.454405101, p < 2.2e-16 )
+moran.test(TenYrTally_Malaria_ON$bhmSIR, ON_SpatialWeightsList)
+
+# Enteric Fever SIRs ( M1 = 0.4648618627, p < 2.2e-16 )
+moran.test(TenYrTally_Enteric_ON$bhmSIR, ON_SpatialWeightsList)
+
+# Pooled SIRs ( M1 = 0.5944372992, p < 2.2e-16 )
+  #NOTE - This is run in the exhibits script not here
+moran.test(TenYrTally_Pooled_ON$bhmSIR, ON_SpatialWeightsList)
+```
+
+Table S2 - Unadjusted Drivetime analysis in the GTA
+```{r, Create neighbourhood matrix for GTA}
+#Create spatial weights matrix that will be needed for Moran's and other calculations 
+
+##  poly2nb function builds a neighbours list based on regions with contiguous boundaries
+  ### Default is Queen as opposed to rook criteria 
+GTA_NeighboursList <- poly2nb(GTA_FSAs, row.names=GTA_FSAs$CFSAUID, queen=TRUE)
+
+#Turn the neighbouhood into a spatial weights matrix, with row standardization 
+GTA_SpatialWeightsMatrix <- nb2mat(GTA_NeighboursList, style='W')
+
+# Turn the neighbouhood into a spatial list object 
+GTA_SpatialWeightsList <-  nb2listw(GTA_NeighboursList, style='W', zero.policy=TRUE)
+```
+
+```{r, Compute unadjusted impact of travel time - pooled}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_GTA.adj", GTA_NeighboursList )
+INLA_nb <- inla.read.graph(filename = "INLA_GTA.adj")
+
+TenYrTally_Pooled_GTA <- TenYrTally_Pooled_ON[TenYrTally_Pooled_ON$CFSAUID %in% GTA_FSAs_Names,]
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+v_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+
+formula_Travel <- ObservedCases ~ TravelTime + 
+                  f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                  f(v_IndexVec, model = "iid")
+
+INLA_Results_Travel <- inla(formula_Travel, family = "zeroinflatednbinomial2", data = TenYrTally_Pooled_GTA@data, E = ExpectedCases, 
+                            control.predictor = list(compute = TRUE),
+                            control.compute = list(waic = TRUE))
+
+INLA_Results_Travel$waic
+
+# Compare the WAICs to see if the more complicated BYM model fits the data better
+  ## WAIC for Besag model: 1144.569
+  ## WAIC for BYM model: 1142.51
+  ## Doesn't look like it does make a big difference...
+
+# Unadjusted impact of travel time to nearest travel clinic on cases 
+  # Mean = -0.058 (95% CI -0.086 - -0.031)
+  # Exponentiated = 0.9436499 (95% CI 0.9175942 - 0.9694756)
+  # Estimates do not cross 1, thus significant 
+  # Each minute increase in drive time is associated with a ~6% decrease in cases relative 
+summary(INLA_Results_Travel)
+```
+
+
+

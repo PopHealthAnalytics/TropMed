@@ -1,0 +1,172 @@
+---
+title: "Geographic clustering of travel-acquired infections in Ontario, Canada, 2008-2020 - Census Data Prep"
+author: "Vinyas Harish et al. PLOS Global Public Health 2023"
+date: "27/01/2023"
+output: html_document
+---
+
+```{r, Load and clean census data}
+#Data wrangling  
+library(tidyverse)
+
+#Mapping 
+library(tmap)
+library(sf)
+library(sp)
+library(spdep)
+library(raster)
+library(rgdal)
+library(RColorBrewer)
+
+#Load in census data and rename columns  ####
+CENSUS <- read.csv("PATH/CENSUS-16-FSA.csv") %>%
+          dplyr::select(-(COL0)) %>%
+          rename(FSA = COL1,
+                 Population = COL2,
+                 KnowledgeOfLanguage_Total = COL3,
+                 KnowledgeOfLanguage_English = COL4,
+                 KnowledgeOfLanguage_French = COL5,
+                 KnowledgeOfLanguage_EnglishAndFrench = COL6,
+                 KnowledgeOfLanguage_NoEnglishNorFrench = COL7,
+                 ImmigrationStatus_Total = COL8,
+                 ImmigrationStatus_NonImmigrants = COL9,
+                 ImmigrationStatus_Immigrants = COL10,
+                 ImmigrationStatus_Before81 = COL11,
+                 ImmigrationStatus_Between81And90 = COL12,
+                 ImmigrationStatus_Between91And00 = COL13,
+                 ImmigrationStatus_Between01And10 = COL14,
+                 ImmigrationStatus_Between01And05 = COL15,
+                 ImmigrationStatus_Between06And10 = COL16,
+                 ImmigrationStatus_Between11And16 = COL17,
+                 Ethnicity_Total = COL18,
+                 Ethnicity_NorthAm_Other = COL19,
+                 Ethnicity_NorthAm_Aboriginal = COL20,
+                 Ethnicity_European = COL21,
+                 Ethnicity_Caribbean = COL22,
+                 Ethnicity_LatinAm = COL23,
+                 Ethnicity_African = COL24,
+                 Ethnicity_African_CW = COL25,
+                 Ethnicity_African_N = COL26,
+                 Ethnicity_African_SE = COL27,
+                 Ethnicity_African_Other = COL28,
+                 Ethnicity_Asian = COL29,
+                 Ethnicity_Asian_MiddleEastern = COL30,
+                 Ethnicity_Asian_South = COL31,
+                 Ethnicity_Asian_EastSoutheast = COL32,
+                 Ethnicity_Asian_Other = COL33,
+                 Ethnicity_Oceania = COL34,
+                 Education_Total = COL35,
+                 Education_NoCertDipDeg = COL36,
+                 Education_HighSchooDip = COL37,
+                 Education_PostsecondaryCertDipDeg = COL38,
+                 Education_ApprenticeshipTrades = COL39,
+                 Education_CollegeDip = COL40,
+                 Education_Uni_CertDipBelowBSC = COL41,
+                 Education_Uni_CertDipAboveBSC = COL42,
+                 TransportToWork_Total = COL43,
+                 TransportToWork_CarVanTruck_Driving = COL44,
+                 TransportToWork_CarVanTruck_Passenger = COL45,
+                 TransportToWork_PublicTransit = COL46,
+                 TransportToWork_Bike = COL47,
+                 TransportToWork_Walk = COL48,
+                 TransportToWork_Other = COL49,
+                 HouseholdAfterTaxIncome_Value = COL50,
+                 HouseholdAfterTaxIncome_Total = COL51) %>% 
+          dplyr::select(-c(HouseholdAfterTaxIncome_Total, ImmigrationStatus_Between01And05, ImmigrationStatus_Between06And10))
+
+# Convert to proportions ####
+CENSUS_PROPORTIONS <- CENSUS %>% mutate(KnowledgeOfLanguage_English = (KnowledgeOfLanguage_English / KnowledgeOfLanguage_Total) *100,
+                                        KnowledgeOfLanguage_French = (KnowledgeOfLanguage_French / KnowledgeOfLanguage_Total) *100,
+                                        KnowledgeOfLanguage_EnglishAndFrench = (KnowledgeOfLanguage_EnglishAndFrench / KnowledgeOfLanguage_Total) *100,
+                                        KnowledgeOfLanguage_NoEnglishNorFrench = (KnowledgeOfLanguage_NoEnglishNorFrench / KnowledgeOfLanguage_Total) *100,
+                                        ImmigrationStatus_NonImmigrants = (ImmigrationStatus_NonImmigrants/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Immigrants = (ImmigrationStatus_Immigrants/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Before81 = (ImmigrationStatus_Before81/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Between81And90 = (ImmigrationStatus_Between81And90/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Between91And00 = (ImmigrationStatus_Between91And00/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Between01And10 = (ImmigrationStatus_Between01And10/ImmigrationStatus_Total) *100,
+                                        ImmigrationStatus_Between11And16 = (ImmigrationStatus_Between11And16/ImmigrationStatus_Total) *100,
+                                        Ethnicity_NorthAm_Other = (Ethnicity_NorthAm_Other/Ethnicity_Total)*100,
+                                        Ethnicity_NorthAm_Aboriginal = (Ethnicity_NorthAm_Aboriginal/Ethnicity_Total)*100,
+                                        Ethnicity_European = (Ethnicity_European/Ethnicity_Total)*100,
+                                        Ethnicity_Caribbean = (Ethnicity_Caribbean/Ethnicity_Total)*100,
+                                        Ethnicity_LatinAm = (Ethnicity_LatinAm/Ethnicity_Total)*100,
+                                        Ethnicity_African = (Ethnicity_African/Ethnicity_Total)*100,
+                                        Ethnicity_African_CW = (Ethnicity_African_CW/Ethnicity_Total)*100,
+                                        Ethnicity_African_N = (Ethnicity_African_N/Ethnicity_Total)*100,
+                                        Ethnicity_African_SE = (Ethnicity_African_SE/Ethnicity_Total)*100,
+                                        Ethnicity_African_Other = (Ethnicity_African_Other/Ethnicity_Total)*100,
+                                        Ethnicity_Asian = (Ethnicity_Asian/Ethnicity_Total)*100,
+                                        Ethnicity_Asian_MiddleEastern = (Ethnicity_Asian_MiddleEastern/Ethnicity_Total)*100,
+                                        Ethnicity_Asian_South = (Ethnicity_Asian_South/Ethnicity_Total)*100,
+                                        Ethnicity_Asian_EastSoutheast = (Ethnicity_Asian_EastSoutheast/Ethnicity_Total)*100,
+                                        Ethnicity_Asian_Other = (Ethnicity_Asian_Other/Ethnicity_Total)*100,
+                                        Ethnicity_Oceania = (Ethnicity_Oceania/Ethnicity_Total)*100,
+                                        Education_NoCertDipDeg = (Education_NoCertDipDeg/Education_Total)*100,
+                                        Education_HighSchooDip = (Education_HighSchooDip/Education_Total)*100,
+                                        Education_PostsecondaryCertDipDeg = (Education_PostsecondaryCertDipDeg/Education_Total)*100,
+                                        Education_ApprenticeshipTrades = (Education_ApprenticeshipTrades/Education_Total)*100,
+                                        Education_CollegeDip = (Education_CollegeDip/Education_Total)*100,
+                                        Education_Uni_CertDipBelowBSC = (Education_Uni_CertDipBelowBSC/Education_Total)*100,
+                                        Education_Uni_CertDipAboveBSC = (Education_Uni_CertDipAboveBSC/Education_Total)*100,
+                                        TransportToWork_CarVanTruck_Driving = (TransportToWork_CarVanTruck_Driving/TransportToWork_Total)*100,
+                                        TransportToWork_CarVanTruck_Passenger = (TransportToWork_CarVanTruck_Passenger/TransportToWork_Total)*100,
+                                        TransportToWork_PublicTransit = (TransportToWork_PublicTransit/TransportToWork_Total)*100,
+                                        TransportToWork_Bike = (TransportToWork_Bike/TransportToWork_Total)*100,
+                                        TransportToWork_Walk = (TransportToWork_Walk/TransportToWork_Total)*100)                 
+
+
+#Load in shapefiles 
+ProvBoundaries <- shapefile("PATH/ProvincialBoundaries.shp")
+CMAs <- shapefile("PATH/CMAs.shp")
+FSAs <- shapefile("PATH/Shapefiles/FSAs.shp")
+DAs <-  shapefile("PATH/DAs.shp")
+
+#Subselect boundary files 
+ON_Boundary <- subset(ProvBoundaries, PRENAME=="Ontario") 
+ON_FSAs <- subset(FSAs, PRNAME=="Ontario")
+ON_DAs <- subset(DAs, PRNAME=="Ontario")
+TO <- subset(CMAs, CMANAME=="Toronto")
+
+GTA_FSAs <- intersect(TO, ON_FSAs)
+GTA_FSAs_List <- GTA_FSAs$CFSAUID
+
+GTA_FSA_CENSUS <- merge(GTA_FSAs, CENSUS_PROPORTIONS, by.x="CFSAUID", by.y="FSA")
+```               
+
+```{r, Plots of census characteristics}
+# Income ############
+tmap_mode("view")+
+tm_shape(GTA_FSA_CENSUS)+
+tm_borders(col="black")+
+tm_fill("HouseholdAfterTaxIncome_Value", title = "2016 Census - Household After Tax Income", palette ="RdYlGn", id="CFSAUID")+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+
+# Transportation ############
+tmap_mode("view")+
+tm_shape(GTA_FSA_CENSUS)+
+tm_borders(col="black")+
+tm_fill("TransportToWork_PublicTransit", title = "2016 Census - Public Transit to Work (%)", palette ="Reds", id="CFSAUID")+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+
+# Ethnicity ############
+tmap_mode("view")+
+tm_shape(GTA_FSA_CENSUS)+
+tm_borders(col="black")+
+tm_fill("Ethnicity_Asian_South", title = "2016 Census - South Asian Ethnicity (%)", palette ="YlOrBr", id="CFSAUID")+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+
+GTA_FSA_CENSUS_wBlackJoined <- CENSUS_PROPORTIONS %>% mutate(Ethnicity_Black = Ethnicity_Caribbean + Ethnicity_African)
+GTA_FSA_CENSUS_wBlackJoined <- merge(GTA_FSAs, GTA_FSA_CENSUS_wBlackJoined, by.x="CFSAUID", by.y="FSA")
+
+tmap_mode("view")+
+tm_shape(GTA_FSA_CENSUS_wBlackJoined)+
+tm_borders(col="black")+
+tm_fill("Ethnicity_Black", title = "2016 Census - Black (Afro+Caribbean) Ethnicity (%)", palette ="Greys", id="CFSAUID")+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+

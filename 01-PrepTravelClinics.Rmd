@@ -1,0 +1,205 @@
+---
+title: "Geographic clustering of travel-acquired infections in Ontario, Canada, 2008-2020 - Travel Clinic Data Prep"
+author: "Vinyas Harish et al. PLOS Global Public Health 2023"
+date: "27/01/2023"
+output: html_document
+---
+
+```{r, Setup}
+rm(list=ls())
+
+#Data Manipulation 
+library(dplyr)
+library(stringr)
+library(rvest)
+library(xml2)
+library(lubridate)
+library(readxl)
+
+#Geocoding and drive time
+library(ggmap)
+library(osrm)
+library(rgeos)
+
+#Mapping 
+library(tmap)
+library(sf)
+library(raster)
+library(rgdal)
+library(RColorBrewer)
+
+firstRun <- FALSE 
+
+if (firstRun == TRUE) {
+  #Pull the table off the website 
+  webpage_url <- "https://www.canada.ca/en/public-health/services/travel-health/yellow-fever/vaccination-centres-canada-ontario.html"
+  webpage <- xml2::read_html(webpage_url)
+  ClinicTable <- rvest::html_table(webpage)[[1]] %>% tibble::as_tibble() %>% 
+                                                     dplyr::select(Clinic, Address, City, `Postal Code`) %>%
+                                                     tidyr::unite(FullAddress, Address, City, sep=", ")
+
+  #Use google maps API to pull the latitudes and longitudes 
+  API_KEY <- "FILL_WITH_REAL_KEY_FROM_GOOGLE_CLOUD"
+  register_google(API_KEY)
+  TravelClinics <- ClinicTable %>% mutate_geocode(FullAddress)
+  
+  #Count missing entries
+  table(is.na(TravelClinics$lon))
+  table(is.na(TravelClinics$lat))
+   
+  #Write to CSV and manually fill in missing entries 
+  write.csv(TravelClinics, "PATH/TravelClinics.csv") 
+} else {
+  TravelClinics <- read_xlsx("PATH/TravelClinics_Manual.xlsx")
+  TravelClinics <- as.data.frame(TravelClinics) %>% mutate(`Postal Code` = str_replace(`Postal Code`, pattern="¬†", replacement = " ")) %>%
+                                                    rename(PostalCode=`Postal Code`,
+                                                           Lon = lon,
+                                                           Lat = lat) %>%
+                                                    mutate(FSA = substr(PostalCode, 1, 3))  
+                                    
+}
+
+#Load in shapefiles 
+ProvBoundaries <- shapefile("PATH/ProvincialBoundaries.shp")
+CMAs <- shapefile("PATH/CMAs.shp")
+FSAs <- shapefile("PATH/FSAs.shp")
+DAs <-  shapefile("PATH/DAs.shp")
+
+#Subselect boundary files 
+ON_Boundary <- subset(ProvBoundaries, PRENAME=="Ontario") 
+ON_FSAs <- subset(FSAs, PRNAME=="Ontario")
+ON_DAs <- subset(DAs, PRNAME=="Ontario")
+TO <- subset(CMAs, CMANAME=="Toronto")
+
+GTA_FSAs <- intersect(TO, ON_FSAs)
+GTA_FSAs_List <- GTA_FSAs$CFSAUID
+
+#Load in pooled data 
+Pooled <- read.csv("PATH//Pooled-Cleaned.csv")
+Pooled %<>% rename(FSA=patient_zipode)
+Pooled$FSA <- strtrim(Pooled$FSA , width=3)
+TenYrTally_Pooled <- Pooled %>% group_by(FSA) %>% tally()
+TenYrTally_Pooled <- merge(GTA_FSAs, TenYrTally_Pooled, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Pooled$n[is.na(TenYrTally_Pooled$n)] <- 0
+```
+
+```{r Map travel clinics in the GTA}
+icon <-  tmap_icons('travel.png')
+
+#CRS needed for projection into space 
+GTA_TravelClinics <- TravelClinics %>% filter(FSA %in% GTA_FSAs_List)
+GTA_TravelClinics_POIs <-  GTA_TravelClinics %>% st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+
+tmap_mode("view")+
+tm_shape(TenYrTally_Pooled)+
+tm_borders(col="black")+
+tm_fill("n", title = "Number of Tropical Disease Cases 2008-2019", palette = "YlOrRd", breaks = c(0, 5, 25, 50, 100, 150, 200, 250))+
+tm_layout(frame = FALSE, main.title="Pooled Tropical Disease Period Prevalence 2008-2019 and Travel Clinics in GTA")+
+tm_shape(GTA_TravelClinics_POIs) + tm_symbols(shape = icon, size = 0.3, border.lwd = NA) +
+tm_legend(outside=TRUE)
+```
+
+```{r, Calculate drive times from the centroid of each GTA FSA to the nearest travel clinic}
+# Following the approach of: https://rpubs.com/mgei/drivingtimes
+
+###############################################################################################################################
+# Terminal commands to initiate the Docker container #
+###############################################################################################################################
+# Download routing data
+  # wget http://download.geofabrik.de/north-america/canada/ontario-latest.osm.pbf
+
+# Launch Docker container 
+  # docker run -t -v "${PWD}:/data" osrm/osrm-backend osrm-extract -p /opt/car.lua /data/ontario-latest.osm.pbf
+  # docker run -t -v "${PWD}:/data" osrm/osrm-backend osrm-partition /data/ontario-latest.osrm
+  # docker run -t -v "${PWD}:/data" osrm/osrm-backend osrm-customize /data/ontario-latest.osrm
+  # docker run -t -i -p 5000:5000 -v "${PWD}:/data" osrm/osrm-backend osrm-routed --algorithm mld /data/ontario-latest.osrm
+
+# Request a route from Toronto to Kingston as a test 
+  # curl "http://localhost:5000/route/v1/driving/79.3832,43.6532;75.6972,45.4215?steps=true"
+
+###############################################################################################################################
+
+#Configure OSRM to use the local host running off of the Docker container configured above
+
+OSRM_CONFIG = "SERVER"
+#OSRM_CONFIG = "DOCKER"
+
+if (OSRM_CONFIG == "SERVER"){
+  options(osrm.server = "http://router.project-osrm.org/")  
+}else{
+  options(osrm.server = "http://localhost:5000/")
+}
+
+#Get centroid of each FSA
+GTA_Centroids <- SpatialPointsDataFrame(rgeos::gCentroid(GTA_FSAs, byid = TRUE), GTA_FSAs@data, match.ID=FALSE)
+
+#Change the coordinate system to a WGS84 projection 
+st_crs(GTA_Centroids)
+GTA_Centroids <- st_as_sf(GTA_Centroids)
+GTA_Centroids <- st_transform(GTA_Centroids, "+proj=longlat +datum=WGS84")
+
+GTA_TravelClinics_POIs <- st_transform(GTA_TravelClinics_POIs, "+proj=longlat +datum=WGS84") 
+
+#Plot centroids as a sanity check after coordinate transformation
+tm_shape(TenYrTally_Pooled)+
+tm_borders(col="black")+
+tm_shape(GTA_Centroids)+tm_symbols(col='red', size = 0.1, border.lwd = NA)
+
+#Run through OSRM server 
+GTA_Centroids_DF <- GTA_Centroids %>% 
+                    mutate(id= CFSAUID,
+                           lon = unlist(map(GTA_Centroids$geometry,1)),
+                           lat = unlist(map(GTA_Centroids$geometry,2))) %>% 
+                    as.data.frame() %>%
+                    dplyr::select(id, lon, lat)
+                    
+
+GTA_TravelClinics_DF <- GTA_TravelClinics %>% 
+                        dplyr::select(id = Clinic, 
+                                      lon = Lon, 
+                                      lat = Lat) %>% 
+                        as.data.frame()
+
+#Keep track of runtime  
+t0 <- Sys.time()
+
+#Note:  For some reason... this only works server-side with a max of 100x100 (10,000) requests...
+  #Beyond that, I get "The OSRM server returned an error: Error: object of type 'closure' is not subsettable"
+  #So what I do here is I make server calls in chunks and then put the matrix back together again
+distancetable <- osrmTable(src = GTA_Centroids_DF[1:100,], 
+                           dst = GTA_TravelClinics_DF[1:100,])
+
+distancetable2 <- osrmTable(src = GTA_Centroids_DF[101:182,], 
+                           dst = GTA_TravelClinics_DF[1:100,])
+
+distancetable3 <- osrmTable(src = GTA_Centroids_DF[1:182,], 
+                           dst = GTA_TravelClinics_DF[101:136,])
+
+jointDistanceTable <- rbind(distancetable[[1]], distancetable2[[1]])
+jointDistanceTable <- cbind(jointDistanceTable, distancetable3[[1]])
+
+#Report runtime
+Sys.time() - t0
+
+#Get the minimum distances from each FSA to the nearest travel clinic 
+minTravelTimes <- as.data.frame(as.data.frame(t(jointDistanceTable)) %>% apply(2, FUN=min)) %>%
+                  rename(TravelTime=`as.data.frame(t(jointDistanceTable)) %>% apply(2, FUN = min)`)  %>%
+                  rownames_to_column("FSA")
+
+
+```
+
+```{r, Map drive times from FSA centroids in the GTA to the nearest travel clinic}
+minTravelTimes <- merge(GTA_FSAs, minTravelTimes, by.x="CFSAUID", by.y="FSA")
+
+icon <-  tmap_icons('travel.png')
+
+tmap_mode("view")+
+tm_shape(minTravelTimes)+
+tm_borders(col="black")+
+tm_fill("TravelTime", title = "OSRM Drivetime Distance to Closest Travel Clinic (mins)", palette ="-RdYlGn", id="CFSAUID")+
+tm_layout(frame = FALSE, main.title="Drivetime Distance to Travel Clinics in GTA")+
+tm_shape(GTA_TravelClinics_POIs) + tm_symbols(shape = icon, size = 0.3, border.lwd = NA) +
+tm_legend(outside=TRUE)
+```
+

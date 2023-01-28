@@ -1,0 +1,542 @@
+---
+title: "Geographic clustering of travel-acquired infections in Ontario, Canada, 2008-2020 - Main Exhibits"
+author: "Vinyas Harish et al. PLOS Global Public Health 2023"
+date: "27/01/2023"
+output: html_document
+---
+
+```{r, Setup workspace}
+rm(list = ls())
+
+#Data Manipulation
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(magrittr)
+
+#Plotting
+library(ggpubr)
+library(scales)
+
+#Mapping 
+library(tmap)
+library(sf)
+library(sp)
+library(spdep)
+library(raster)
+library(rgdal)
+library(RColorBrewer)
+
+#Bayesian modelling
+library(INLA)
+
+#For better reproducibility of INLA results
+set.seed(8272021)
+
+#Load in data 
+Arboviruses  <- read.csv("PATH/Arboviruses-Cleaned.csv")
+Enteric <- read.csv("PATH/Enteric-Cleaned.csv")
+Malaria <- read.csv("PATH/Malaria-Cleaned.csv")
+Pooled <- read.csv("PATH/Pooled-Cleaned.csv")
+Census <- read.csv("PATH/CENSUS-16-FSA-CLEAN.csv") %>%
+          dplyr::select(-X)
+MinDriveTimes <- read.csv("PATH/MinDriveTimes.csv")
+
+#Trim zipcodes to postal codes
+Arboviruses %<>% dplyr::rename(FSA=patient_fsa)
+
+Enteric %<>% dplyr::rename(FSA=patient_fsa)
+
+Malaria %<>% dplyr::rename(FSA=patient_fsa)
+
+Pooled %<>% dplyr::rename(FSA=patient_fsa)
+
+#Create additional census category
+Census$ImmigrationStatus_Between01And16 <- Census$ImmigrationStatus_Between01And10 + Census$ImmigrationStatus_Between11And16 
+
+#Load in shapefiles 
+ProvBoundaries <- shapefile("PATH/ProvincialBoundaries.shp")
+CMAs <- shapefile("PATH/Shapefiles/CMAs.shp")
+FSAs <- shapefile("PATH/FSAs.shp")
+DAs <-  shapefile("PATH/DAs.shp")
+
+#Subselect boundary files 
+ON_Boundary <- subset(ProvBoundaries, PRENAME=="Ontario") 
+ON_FSAs <- subset(FSAs, PRNAME=="Ontario")
+ON_DAs <- subset(DAs, PRNAME=="Ontario")
+TO <- subset(CMAs, CMANAME=="Toronto")
+
+GTA_FSAs <- raster::intersect(TO, ON_FSAs)
+
+#Subselect census data 
+ON_FSAs_Names <- ON_FSAs$CFSAUID
+GTA_FSAs_Names <- GTA_FSAs$CFSAUID
+Census_ON <- Census[Census$FSA %in% ON_FSAs_Names,]
+Census_GTA <- Census[Census$FSA %in% GTA_FSAs_Names,]
+
+# Process counts for Figure 1 
+YearlyTally_Arboviruses_ON <- Arboviruses %>% group_by(FSA) %>% 
+                                              filter(FSA %in% ON_FSAs_Names) %>%
+                                              ungroup() %>%
+                                              group_by(login_year) %>% 
+                                              tally() %>% 
+                                              rename(n_Arbovirus = n)
+
+YearlyTally_Enteric_ON <- Enteric %>% group_by(FSA) %>% 
+                                      filter(FSA %in% ON_FSAs_Names) %>%
+                                      ungroup() %>%
+                                      group_by(login_year) %>% 
+                                      tally() %>% 
+                                      rename(n_Enteric = n) %>%
+                                      add_row(login_year = 2008, n_Enteric = NA) %>%
+                                      arrange(login_year)
+
+YearlyTally_Malaria_ON <- Malaria %>% group_by(FSA) %>% 
+                                      filter(FSA %in% ON_FSAs_Names) %>%
+                                      ungroup() %>%
+                                      group_by(login_year) %>% 
+                                      tally() %>% 
+                                      rename(n_Malaria = n) %>%
+                                      add_row(login_year = 2008, n_Malaria = NA) %>%
+                                      arrange(login_year)
+
+YearlyTally_Pooled_ON <- Pooled %>% group_by(FSA) %>% 
+                                    filter(FSA %in% ON_FSAs_Names) %>%
+                                    ungroup() %>%
+                                    group_by(login_year) %>% 
+                                    tally() %>% 
+                                    rename(n_Pooled = n)
+
+YearlyTally_All_ON <- cbind(YearlyTally_Arboviruses_ON, YearlyTally_Enteric_ON, YearlyTally_Malaria_ON, YearlyTally_Pooled_ON) %>%
+                      dplyr::select(c(1,2,4,6,8)) %>%
+                      pivot_longer(cols=starts_with("n_"), names_to="Disease", values_to="NumberOfCases") %>%
+                      mutate(Year=login_year,
+                             Disease=str_replace(Disease, pattern="n_", replacement = ""))
+
+table(Pooled$FSA %in% ON_FSAs_Names)
+
+# Process counts for spatial analyses 
+  ## First, turn raw test-level data into counts of infections by FSA
+  ## Next, left join on FSA to add in drive time data 
+  ## Next, left join on FSA to add in census data 
+  ## Then, replace missing values with 0s 
+  ## Finally, merge to add the spatial polygons
+   
+  ## Arboviruses 
+TenYrTally_Arboviruses_ON <- Arboviruses %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Arboviruses_ON <- merge(ON_FSAs@data, TenYrTally_Arboviruses_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                             rename(FSA=CFSAUID)
+TenYrTally_Arboviruses_ON <- left_join(TenYrTally_Arboviruses_ON, MinDriveTimes, by="FSA")
+TenYrTally_Arboviruses_ON <- left_join(TenYrTally_Arboviruses_ON, Census_ON, by="FSA")
+TenYrTally_Arboviruses_ON <- merge(ON_FSAs, TenYrTally_Arboviruses_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Arboviruses_ON$n[is.na(TenYrTally_Arboviruses_ON$n)] <- 0
+
+ ## Enteric Fever 
+TenYrTally_Enteric_ON <- Enteric %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Enteric_ON <- merge(ON_FSAs@data, TenYrTally_Enteric_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                         rename(FSA=CFSAUID)
+TenYrTally_Enteric_ON <- left_join(TenYrTally_Enteric_ON, MinDriveTimes, by="FSA")
+TenYrTally_Enteric_ON <- left_join(TenYrTally_Enteric_ON, Census_ON, by="FSA")
+TenYrTally_Enteric_ON <- merge(ON_FSAs, TenYrTally_Enteric_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Enteric_ON$n[is.na(TenYrTally_Enteric_ON$n)] <- 0
+
+  ## Malaria
+TenYrTally_Malaria_ON <- Malaria %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Malaria_ON <- merge(ON_FSAs@data, TenYrTally_Malaria_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                         rename(FSA=CFSAUID)
+TenYrTally_Malaria_ON <- left_join(TenYrTally_Malaria_ON, MinDriveTimes, by="FSA")
+TenYrTally_Malaria_ON <- left_join(TenYrTally_Malaria_ON, Census_ON, by="FSA")
+TenYrTally_Malaria_ON <- merge(ON_FSAs, TenYrTally_Malaria_ON, by.x="CFSAUID", by.y="FSA")
+TenYrTally_Malaria_ON$n[is.na(TenYrTally_Malaria_ON$n)] <- 0
+
+  ## Pooled
+TenYrTally_Pooled_ON <- Pooled %>% group_by(FSA) %>% tally() %>% filter(FSA %in% ON_FSAs_Names)
+TenYrTally_Pooled_ON <- merge(ON_FSAs@data, TenYrTally_Pooled_ON, by.x="CFSAUID", by.y="FSA", all.x=TRUE) %>%
+                        rename(FSA=CFSAUID)
+TenYrTally_Pooled_ON <- left_join(TenYrTally_Pooled_ON, MinDriveTimes, by="FSA")
+TenYrTally_Pooled_ON <- left_join(TenYrTally_Pooled_ON, Census_ON, by="FSA")
+TenYrTally_Pooled_ON <- merge(ON_FSAs, TenYrTally_Pooled_ON, by.x="CFSAUID", by.y="FSA", all=TRUE)
+TenYrTally_Pooled_ON$n[is.na(TenYrTally_Pooled_ON$n)] <- 0
+
+#Create spatial weights matrix that will be needed for Moran's and other calculations 
+
+##  poly2nb function builds a neighbours list based on regions with contiguous boundaries
+  ### Default is Queen as opposed to rook criteria 
+ON_NeighboursList <- poly2nb(ON_FSAs, row.names=ON_FSAs$CFSAUID, queen=TRUE)
+
+#Turn the neighbouhood into a spatial weights matrix, with row standardization 
+ON_SpatialWeightsMatrix <- nb2mat(ON_NeighboursList, style='W')
+
+# Turn the neighbouhood into a spatial list object 
+ON_SpatialWeightsList<-  nb2listw(ON_NeighboursList, style='W', zero.policy=TRUE)
+```
+
+Figure 1 - Line graph of cases for different diseases
+```{r, Figure 1}
+YearlyTally_All_ON %>% ggplot(aes(x=Year, y=NumberOfCases, color=Disease)) +
+                             geom_line() + geom_point()+ 
+                             ylab("Number of cases")+scale_x_continuous(breaks= pretty_breaks())+
+                             theme_bw()+
+                             scale_color_manual(labels=c("Arboviruses", "Enteric fever", "Malaria", "Pooled"),
+                                                values=c("dodgerblue3", "forestgreen", "firebrick", "peru"))
+
+```
+
+Figure 2 - Map of unadjusted BHM-SIRs for Ontario with insets for GTA 
+```{r, Calculate unadjusted BHM SIRs for all diseases}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs 
+ON_Population <- sum(Census_ON$Population)
+ON_TotalPooledCases <- sum(TenYrTally_Pooled_ON$n)
+ON_PooledRate <- ON_TotalPooledCases/ON_Population
+
+TenYrTally_Pooled_ON@data <- TenYrTally_Pooled_ON@data %>% mutate(ExpectedCases = ON_PooledRate * Population) %>%
+                                                           dplyr::rename(ObservedCases = n) %>%
+                                                           mutate(SIR = ObservedCases/ExpectedCases)
+
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_ON.adj", ON_NeighboursList)
+INLA_nb <- inla.read.graph(filename = "INLA_ON.adj")
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Pooled_ON@data)
+v_IndexVec <- 1:nrow(TenYrTally_Pooled_ON@data)
+
+formula <- ObservedCases ~ + f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                             f(v_IndexVec, model = "iid")
+
+INLA_Results <- inla(formula,family = "zeroinflatednbinomial2", data = TenYrTally_Pooled_ON@data, E = ExpectedCases, 
+                     control.predictor = list(compute = TRUE),
+                     control.compute = list(waic = TRUE))
+
+#Compare the WAICs to see if the more complicated BYM model (model="bym") fits the data better
+  ## BYM WAIC: 2637.45
+  ## Besag WAIC: 2644.592
+
+#Note the WAIC is lower with the ZINBR model than with the ZIP models
+
+#Pull out the relative risk, upper limit, and lower limit from the INLA estimates 
+TenYrTally_Pooled_ON@data$bhmSIR <- INLA_Results$summary.fitted.values[, "mean"]
+TenYrTally_Pooled_ON@data$LL <- INLA_Results$summary.fitted.values[, "0.025quant"]
+TenYrTally_Pooled_ON@data$UL <- INLA_Results$summary.fitted.values[, "0.975quant"]
+```
+
+```{r, Figure 2A - ON-wide BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_borders(col="black")+
+tm_fill("bhmSIR", title = "BHM-smoothed TAI SIRs", palette = "YlOrRd", breaks = c(0,1,2,4,6,8,10))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 2B - GTA BHM-SIRs}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_fill("bhmSIR", title = "BHM-smoothed TAI SIRs", palette = "YlOrRd", breaks = c(0,1,2,4,6,8,10))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 2C - ON-wide incidence categories based on BHM SIRs}
+TenYrTally_Pooled_ON@data <- TenYrTally_Pooled_ON@data %>% mutate(IncidenceCat = case_when(LL > 1 & UL > 1 ~ "high-incidence",
+                                                                                           LL < 1 & UL < 1 ~ "low-incidence",
+                                                                                           TRUE ~ "moderate-incidence")) 
+
+TenYrTally_Pooled_ON@data$IncidenceCat <- factor(TenYrTally_Pooled_ON@data$IncidenceCat, levels=c("low-incidence","moderate-incidence","high-incidence")) 
+
+#Plot province-wide map
+tmap_mode("plot")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_borders(col="black")+
+tm_fill("IncidenceCat", title = "TAI-incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("left", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 2D - GTA incidence levels}
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_fill("IncidenceCat", title = "TAI-incidence levels", palette = "-RdBu")+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, In text result - Global Moran's on BHM SIRs}
+# Moran I test under randomisation
+# 
+# data:  TenYrTally_Pooled_ON$bhmSIR  
+# weights: ON_SpatialWeightsList    
+# 
+# Moran I statistic standard deviate = 21.223, p-value < 2.2e-16
+# alternative hypothesis: greater
+# sample estimates:
+# Moran I statistic       Expectation          Variance 
+#       0.5944372992      -0.0019531250       0.0007896994  
+moran.test(TenYrTally_Pooled_ON$bhmSIR, ON_SpatialWeightsList)
+```
+
+```{r, In text result - Where are the high incidence FSAs?}
+#How many are in the GTA? 
+TenYrTally_Pooled_ON@data %>% filter(RiskCat=="high-risk") %>% filter(CFSAUID %in% GTA_FSAs_Names)
+
+#How many are not in the GTA? 
+TenYrTally_Pooled_ON@data %>% filter(RiskCat=="high-risk") %>% filter(!(CFSAUID %in% GTA_FSAs_Names))
+
+```
+
+Figure 3 - Maps of GTA for each disease
+```{r, Figure 3A - Arboviruses}
+palette_arboviruses <- brewer.pal(n = 6, name = "Blues")
+palette_arboviruses <- c("#FFFFFF", palette_arboviruses)
+
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Arboviruses_ON)+
+tm_fill("n", title = "Arbovirus cases, 2008-2020", palette = palette_arboviruses, breaks=c(0,1,5,10,20,30,40),
+         labels = c("0", "1-5", "5-10", "10-20","20-30", "30-40"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 3B - Malaria}
+palette_malaria <- brewer.pal(n = 9, name = "Reds")
+palette_malaria <- c("#FFFFFF", palette_malaria)
+
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Malaria_ON)+
+tm_fill("n", title = "Malaria cases, 2009-2020", palette = palette_malaria, breaks=c(0,1,5,10,20,30,40,50,60,70),
+        labels = c("0", "1-5", "5-10", "10-20","20-30", "30-40", "40-50", "50-60", "60-70"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 3C - Enteric Fever}
+palette_enteric <- brewer.pal(n = 9, name = "Greens")
+palette_enteric <- c("#FFFFFF", palette_enteric)
+
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Enteric_ON)+
+tm_fill("n", title = "Enteric fever cases, 2009-2020", palette = palette_enteric, breaks = c(0, 1, 10, 20,40,60,80,100,120,140),
+         labels = c("0", "1-10","10-20","20-40","40-60", "60-80", "80-100", "100-120", "120-140"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+```{r, Figure 3D - Pooled}
+palette_pooled <- brewer.pal(n = 8, name = "YlOrBr")
+palette_pooled <- c("#FFFFFF", palette_pooled)
+
+tmap_mode("plot")+
+tm_shape(GTA_FSAs)+
+tm_borders(col="black")+
+tm_shape(TenYrTally_Pooled_ON)+
+tm_fill("ObservedCases", title = "Pooled TAI cases, 2008-2020", palette = palette_pooled, breaks = c(0, 1, 10, 25,50,100,150,200,250), 
+        labels = c("0", "1-10", "10-25", "25-50","50-100", "100-150", "150-200", "200-250"))+
+tm_compass(type="arrow")+
+tm_scale_bar(position=c("right", "bottom"))+
+tm_layout(frame = FALSE)+
+tm_legend(outside=TRUE)
+```
+
+Figure 4 / Table 1 - Compare high vs low incidence clusters
+```{r, Boxplots of key census variables}
+ON_CompareClusters  <- TenYrTally_Pooled_ON@data %>% 
+                       dplyr::select(IncidenceCat, ImmigrationStatus_Immigrants, ImmigrationStatus_Between01And16, HouseholdAfterTaxIncome_Value, 
+                                     Education_NoCertDipDeg, Education_Uni_CertDipAboveBSC, KnowledgeOfLanguage_NoEnglishNorFrench)
+
+my_comparisons <- list( c("low-incidence","high-incidence"))
+
+#Comparing based on immigration 
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "ImmigrationStatus_Immigrants", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrant", xlab = "Cluster Type") + rremove("legend") +
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "ImmigrationStatus_Between01And16", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% immigrated between 2001-2016", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+#Comparing based on income 
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "HouseholdAfterTaxIncome_Value", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "Household After-tax Income", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 150000)  
+
+#Comparing based on education
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "Education_NoCertDipDeg", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% no certificate, diploma, degree", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 55)  
+
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "Education_Uni_CertDipAboveBSC", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% university certificate/diploma above BSc", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 85)  
+
+#Comparing based on language
+ggboxplot(ON_CompareClusters, x = "IncidenceCat", y = "KnowledgeOfLanguage_NoEnglishNorFrench", 
+          color = "IncidenceCat", palette = c("dodgerblue4", "navajowhite3", "firebrick2"),
+          order = c("low-incidence", "moderate-incidence", "high-incidence"),
+          ylab = "% no knowledge of English/French", xlab = "Cluster Type") + rremove("legend")+
+          stat_compare_means(comparisons = my_comparisons) + 
+          stat_compare_means(label.y = 30)  
+
+```
+
+Table 2 - Drivetime analysis in the GTA
+```{r, Create neighbourhood matrix for GTA}
+#Create spatial weights matrix that will be needed for Moran's and other calculations 
+
+##  poly2nb function builds a neighbours list based on regions with contiguous boundaries
+  ### Default is Queen as opposed to rook criteria 
+GTA_NeighboursList <- poly2nb(GTA_FSAs, row.names=GTA_FSAs$CFSAUID, queen=TRUE)
+
+#Turn the neighbouhood into a spatial weights matrix, with row standardization 
+GTA_SpatialWeightsMatrix <- nb2mat(GTA_NeighboursList, style='W')
+
+# Turn the neighbouhood into a spatial list object 
+GTA_SpatialWeightsList <-  nb2listw(GTA_NeighboursList, style='W', zero.policy=TRUE)
+```
+
+```{r, Compute unadjusted impact of travel time - pooled}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_GTA.adj", GTA_NeighboursList )
+INLA_nb <- inla.read.graph(filename = "INLA_GTA.adj")
+
+TenYrTally_Pooled_GTA <- TenYrTally_Pooled_ON[TenYrTally_Pooled_ON$CFSAUID %in% GTA_FSAs_Names,]
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+v_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+
+formula_Travel <- ObservedCases ~ TravelTime + 
+                  f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                  f(v_IndexVec, model = "iid")
+
+INLA_Results_Travel <- inla(formula_Travel, family = "zeroinflatednbinomial2", data = TenYrTally_Pooled_GTA@data, E = ExpectedCases, 
+                            control.predictor = list(compute = TRUE),
+                            control.compute = list(waic = TRUE))
+
+INLA_Results_Travel$waic
+
+# Compare the WAICs to see if the more complicated BYM model fits the data better
+  ## WAIC for Besag model: 1144.569
+  ## WAIC for BYM model: 1142.51
+  ## Doesn't look like it does make a big difference...
+
+# Unadjusted impact of travel time to nearest travel clinic on cases 
+  # Mean = -0.058 (95% CI -0.086 - -0.031)
+  # Exponentiated = 0.9436499 (95% CI 0.9175942 - 0.9694756)
+  # Estimates do not cross 1, thus significant 
+  # Each minute increase in drive time is associated with a ~6% decrease in cases relative 
+summary(INLA_Results_Travel)
+```
+
+```{r, Compute adjusted impact of travel time - pooled}
+# Based on the following tutorial: https://www.paulamoraga.com/book-geospatial/sec-arealdataexamplespatial.html#mapping-sirs
+#Save the spatial neighbours as an adjacency matrix that can be read by INLA 
+nb2INLA("INLA_GTA.adj", GTA_NeighboursList)
+INLA_nb <- inla.read.graph(filename = "INLA_GTA.adj")
+
+#The model includes two random effects, namely, ui for modeling the spatial residual variation, and vi for modeling unstructured noise
+u_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+v_IndexVec <- 1:nrow(TenYrTally_Pooled_GTA@data)
+
+formula_AdjTravel <- ObservedCases ~ TravelTime + 
+                                     KnowledgeOfLanguage_NoEnglishNorFrench + ImmigrationStatus_Immigrants + 
+                                     Ethnicity_Caribbean + Ethnicity_African + Ethnicity_LatinAm + 
+                                     Ethnicity_Asian_MiddleEastern + Ethnicity_Asian_EastSoutheast + Ethnicity_Asian_South + 
+                                     Education_PostsecondaryCertDipDeg +
+                                     log(HouseholdAfterTaxIncome_Value) + 
+                  f(u_IndexVec, model = "besag", graph = INLA_nb, scale.model = TRUE) +
+                  f(v_IndexVec, model = "iid")
+
+INLA_Results_AdjTravel <- inla(formula_AdjTravel, family = "zeroinflatednbinomial2", data = TenYrTally_Pooled_GTA@data, E = ExpectedCases, 
+                               control.predictor = list(compute = TRUE),
+                               control.compute = list(waic = TRUE))
+
+# Compare the WAICs to see if the more complicated BYM model fits the data better
+  ## INLA_Results_AdjTravel$waic
+  ## WAIC for Besag model: 1158.802
+  ## WAIC for BYM model:  1156.753
+  ## Doesn't look like it does...
+
+# Unadjusted impact of travel time to nearest travel clinic on cases 
+  # Mean = -0.035 (95% CI -0.059 - -0.012)
+  # Exponentiated = 0.9656054 (95% CI 0.9427068 - 0.9880717)
+  # Estimates do not cross 1, thus significant 
+  # Each minute increase in drive time corresponds to a ~ 3% decrease in cases 
+summary(INLA_Results_AdjTravel)
+```
+
+```{r, Calculate change in variance of posterior SIRs bn adj and unadj}
+# How much of the variance was explained by the covariates added?
+varianceUnadj <- var(INLA_Results_Travel$summary.fitted.values[, "mean"])
+
+#There is one value with a really high posterior that should be excluded 
+adjResults <- INLA_Results_AdjTravel$summary.fitted.values[, "mean"]
+adjResults <- adjResults[adjResults < 10]
+varianceAdj <- var(adjResults)
+
+((varianceAdj - varianceUnadj) / varianceUnadj) * 100
+```
+
+Extra:
+```{r, Plot unadjusted SIRs and the locations of travel clinics - pooled }
+TravelClinics <- read_xlsx("PATH/TravelClinics_Manual.xlsx")
+TravelClinics <- as.data.frame(TravelClinics) %>% mutate(`Postal Code` = str_replace(`Postal Code`, pattern="¬†", replacement = " ")) %>%
+                                                    rename(PostalCode=`Postal Code`,
+                                                           Lon = lon,
+                                                           Lat = lat) %>%
+                                                    mutate(FSA = substr(PostalCode, 1, 3))  
+  
+icon <-  tmap_icons('travel.png')
+
+#CRS needed for projection into space 
+GTA_TravelClinics <- TravelClinics %>% filter(FSA %in% GTA_FSAs_Names)
+GTA_TravelClinics_POIs <-  GTA_TravelClinics %>% st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+
+tmap_mode("view")+
+tm_shape(TenYrTally_Pooled)+
+tm_borders(col="black")+
+tm_fill("SIR", title = "BHM-estimated SIRs of Tropical Disease Cases 2008-2020", palette = "YlOrRd",)+
+tm_layout(frame = FALSE)+
+tm_shape(GTA_TravelClinics_POIs) + tm_symbols(shape = icon, size = 0.3, border.lwd = NA) +
+tm_legend(outside=TRUE)
+```

@@ -1,0 +1,347 @@
+---
+title: "Geographic clustering of travel-acquired infections in Ontario, Canada, 2008-2020 - Case Data Prep"
+author: "Vinyas Harish et al. PLOS Global Public Health 2023"
+date: "27/01/2023"
+output: html_document
+---
+
+Load in libraries and data:
+```{r setup, include=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(lubridate)
+
+#Read in data
+TropMed <- read.csv("PATH/TropicalDiseases-Updated-Final.csv") 
+
+#Count null FSAs
+table(TropMed$patient_fsa=="NUL") 
+
+#Minor cleaning, dropping postal codes for now since shouldn't be doing any analysis with it 
+TropMed <- TropMed %>% filter(patient_fsa!="NUL") %>%
+                       mutate(age_cat = case_when(age_cat=="a.< 5" ~ "< 5 yrs",
+                                                  age_cat=="c.5-<12 years" ~ "5-11 yrs",
+                                                  age_cat=="d.12-<18 years" ~ "12-17 yrs",
+                                                  age_cat=="e.18-<35 years" ~ "18-34 yrs",
+                                                  age_cat=="f.35-<55 years" ~ "35-54 yrs",
+                                                  age_cat=="g.55-<75 years" ~ "55-74 yrs",
+                                                  age_cat=="h.75+ years" ~ "75+ yrs",
+                                                  age_cat=="i.Unknown" ~ "Unknown"))
+
+#Other changes that don't work as nicely in a pipe 
+TropMed$sample_id <- TropMed$sample_id %>% str_remove("Tropical_")
+
+#Clean up the new, non-standard year formatting...
+TropMed <- TropMed %>% mutate(tempDay = substr(login_date,1,2),
+                              tempMon = substr(login_date,3,5),
+                              tempYr = substr(login_date,6,10)) %>%
+            mutate(tempMon = case_when(tempMon == "jan"~"01",
+                                       tempMon == "feb"~"02",
+                                       tempMon == "mar"~"03",
+                                       tempMon == "apr"~"04",
+                                       tempMon == "may"~"05",
+                                       tempMon == "jun"~"06",
+                                       tempMon == "jul"~"07",
+                                       tempMon == "aug"~"08",
+                                       tempMon == "sep"~"09",
+                                       tempMon == "oct"~"10",
+                                       tempMon == "nov"~"11",
+                                       tempMon == "dec"~"12")) %>%
+          mutate(tempDate = paste(tempDay, tempMon, tempYr, sep = "-")) %>%
+          mutate(login_date = tempDate) %>%
+          select(-c(tempDate, tempDay, tempMon, tempYr))
+
+TropMed$login_date <- as.Date(TropMed$login_date, format = "%d-%m-%Y")
+TropMed <- TropMed %>% mutate(login_year = year(login_date))
+```
+
+Chikungunya:
+```{r}
+#Filter to only the various CHIK tests
+Chik <- TropMed %>% filter(test_targets == "Chik PCR" |
+                           test_targets == "Chikungunya IgM EIA" |
+                           test_targets == "Chikungunya PCR")
+
+#Period prevalance = (total number of cases / total number of people)
+
+#Determine the numerator in two steps
+  #1 - Of the people who have multiple tests, count the unique infections 
+  #2 - Of the people who only have one test, count each infection as unique 
+
+ChikNumerator_MultipleTests <- Chik %>% filter(test_result!="Non-Reactive" & 
+                                               test_result!="Not Detected" & 
+                                               test_result!="Indeterminate")%>% 
+                                        group_by(patid) %>%
+                                        filter(n()>1)
+
+#Initialize number of people to loop through as well as marker of unique infections
+ppl <- unique(ChikNumerator_MultipleTests$patid)
+ChikNumerator_MultipleTests$uniqueIfx <- NA
+
+for (person in ppl){
+  indices <- which(ChikNumerator_MultipleTests$patid == person)
+  
+  #Mark first entry as a unique infection
+  ChikNumerator_MultipleTests$uniqueIfx[indices[1]] <- 1
+  
+  #Calculate the differences between subsequent positive tests
+  dates <-  ChikNumerator_MultipleTests$login_date[indices]
+  differences <- as.numeric(diff((unlist(dates))))
+  testTypes <-  ChikNumerator_MultipleTests$test_name[indices]
+  
+  # Check if subsequent positive tests based on the type of test
+    ## IGM tests have a 365 day window
+    ## PCR tests have a 14 day window
+  for (i in 1:length(differences)){
+    originalIndex <- indices[i+1]
+    
+    if (testTypes[i] == "CKG_IGM"){
+      if (differences[i] > 365){
+          ChikNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          ChikNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }else if (testTypes[i] == "CHIK_PCR"){
+       if (differences[i] > 14){
+          ChikNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          ChikNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }
+  }
+}
+
+ChikNumerator_MultipleTests <- ChikNumerator_MultipleTests %>% filter(uniqueIfx==1)
+
+
+# Append to the list of people who were only tested once
+ChikNumerator_SingleTests <- Chik %>% filter(test_result!="Non-Reactive" & 
+                                             test_result!="Not Detected" & 
+                                             test_result!="Indeterminate") %>% 
+                                      group_by(patid) %>%
+                                      filter(n()==1) %>%
+                                      mutate(uniqueIfx=1) 
+ChikNumerator <- rbind(ChikNumerator_MultipleTests, ChikNumerator_SingleTests)
+
+ChikNumerator %>% group_by(login_year) %>% tally()
+
+#Get denominator by counting the number of distinct patients tested over the entire dataset
+ChikDenominator <- n_distinct(Chik$patid)
+```
+
+Enteric Fever:
+```{r}
+#Period prevalance = (total number of cases / total number of people)
+
+#Determine the numerator in two steps
+  #1 - Of the people who have multiple tests, count the unique infections 
+  #2 - Of the poeple who only have one test, count each infection as unique 
+Enteric <- TropMed %>% filter(test_name == "CULTURE_ENT" |
+                              test_name == "CULTURE_ENT_REF")
+
+
+EntNumerator_MultipleTests <- Enteric %>% filter(test_result!="Not Detected")%>% 
+                                          group_by(patid) %>%
+                                          filter(n()>1)
+
+#Initialize number of people to loop through as well as marker of unique infections
+ppl <- unique(EntNumerator_MultipleTests$patid)
+EntNumerator_MultipleTests$uniqueIfx <- NA
+
+for (person in ppl){
+  indices <- which(EntNumerator_MultipleTests$patid == person)
+  
+  #Mark first entry as a unique infection
+  EntNumerator_MultipleTests$uniqueIfx[indices[1]] <- 1
+  
+  #Calculate the differences between subsequent positive tests
+  dates <-  EntNumerator_MultipleTests$login_date[indices]
+  differences <- as.numeric(diff((unlist(dates))))
+  
+  # Check if subsequent positive tests are outside of our 14-day infection window 
+  for (i in 1:length(differences)){
+    originalIndex <- indices[i+1]
+    if (differences[i] >= 14){
+      EntNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+    }else{
+       EntNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0
+    }
+  }
+}
+
+EntNumerator_MultipleTests <- EntNumerator_MultipleTests %>% filter(uniqueIfx==1)
+
+
+# Append to the list of people who were only tested once
+EntNumerator_SingleTests <- Enteric %>% filter(test_result!="Not Detected") %>% 
+                                        group_by(patid) %>%
+                                        filter(n()==1) %>%
+                                        mutate(uniqueIfx=1) 
+
+EntNumerator <- rbind(EntNumerator_MultipleTests, EntNumerator_SingleTests)
+
+EntNumerator %>% group_by(login_year) %>% tally()
+
+#Get denominator by counting the number of distinct patients tested over the entire dataset
+EntDenominator <- n_distinct(Enteric$patid)
+```
+
+Dengue:
+```{r}
+#Filter to only the various CHIK tests
+Dengue <- TropMed %>% filter(test_targets == "Dengue PCR" |
+                             test_targets == "Dengue IgM EIA")
+
+#Period prevalance = (total number of cases / total number of people)
+#Determine the numerator in two steps
+  #1 - Of the people who have multiple tests, count the unique infections 
+  #2 - Of the poeple who only have one test, count each infection as unique 
+
+DenNumerator_MultipleTests <- Dengue %>% filter(test_result!="Non-Reactive" & 
+                                                test_result!="Not Detected" & 
+                                                test_result!="Indeterminate")%>% 
+                                         group_by(patid) %>%
+                                         filter(n()>1)
+
+#Initialize number of people to loop through as well as marker of unique infections
+ppl <- unique(DenNumerator_MultipleTests$patid)
+DenNumerator_MultipleTests$uniqueIfx <- NA
+
+for (person in ppl){
+  indices <- which(DenNumerator_MultipleTests$patid == person)
+  
+  #Mark first entry as a unique infection
+  DenNumerator_MultipleTests$uniqueIfx[indices[1]] <- 1
+  
+  #Calculate the differences between subsequent positive tests
+  dates <-  DenNumerator_MultipleTests$login_date[indices]
+  differences <- as.numeric(diff((unlist(dates))))
+  testTypes <-  DenNumerator_MultipleTests$test_targets[indices]
+  
+ # Check if subsequent positive tests based on the type of test
+    ## IGM tests have a 365 day window
+    ## PCR tests have a 14 day window
+  for (i in 1:length(differences)){
+    originalIndex <- indices[i+1]
+    
+    if (testTypes[i] == "Dengue IgM EIA"){
+      if (differences[i] > 365){
+          DenNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          DenNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }else if (testTypes[i] == "Dengue PCR"){
+       if (differences[i] > 14){
+          DenNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          DenNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }
+  }
+}
+
+DenNumerator_MultipleTests <- DenNumerator_MultipleTests %>% filter(uniqueIfx==1)
+
+
+# Append to the list of people who were only tested once
+DenNumerator_SingleTests <- Dengue %>% filter(test_result!="Non-Reactive" & 
+                                              test_result!="Not Detected" & 
+                                              test_result!="Indeterminate") %>% 
+                                       group_by(patid) %>%
+                                       filter(n()==1) %>%
+                                       mutate(uniqueIfx=1) 
+DenNumerator <- rbind(DenNumerator_MultipleTests, DenNumerator_SingleTests)
+
+DenNumerator %>% group_by(login_year) %>% tally()
+
+#Get denominator by counting the number of distinct patients tested over the entire dataset
+DenDenominator <- n_distinct(Dengue$patid)
+```
+
+Malaria:
+```{r}
+Malaria <- TropMed %>% filter(test_name == "MALARIA_ICT" |
+                              test_name == "MALARIA_MIC" |
+                              test_name == "MALARIA_PCR" )
+
+#Period prevalance = (total number of cases / total number of people)
+#Determine the numerator in two steps
+  #1 - Of the people who have multiple tests, count the unique infections 
+  #2 - Of the people who only have one test, count each infection as unique 
+MalNumerator_MultipleTests <- Malaria %>% filter(test_result!="Negative" & 
+                                                 test_result!="Not Detected")%>% 
+                                         group_by(patid) %>%
+                                         filter(n()>1)
+
+#Initialize number of people to loop through as well as marker of unique infections
+ppl <- unique(MalNumerator_MultipleTests$patid)
+MalNumerator_MultipleTests$uniqueIfx <- NA
+
+for (person in ppl){
+  indices <- which(MalNumerator_MultipleTests$patid == person)
+  
+  #Mark first entry as a unique infection
+  MalNumerator_MultipleTests$uniqueIfx[indices[1]] <- 1
+  
+  #Calculate the differences between subsequent positive tests
+  dates <-  MalNumerator_MultipleTests$login_date[indices]
+  differences <- as.numeric(diff((unlist(dates))))
+  testTypes <-  MalNumerator_MultipleTests$test_name[indices]
+  
+  # Check if subsequent positive tests based on the type of test
+    ## ICT (rapid antigen test) have a 90 day window
+    ## PCR tests have a 90 day window
+    ## Microscopy has a 14 day window
+  for (i in 1:length(differences)){
+    originalIndex <- indices[i+1]
+    
+    if (testTypes[i] == "MALARIA_ICT"){
+      if (differences[i] > 90){
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }else if (testTypes[i] == "MALARIA_MIC"){
+       if (differences[i] > 14){
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }else if (testTypes[i] == "MALARIA_PCR"){
+       if (differences[i] > 90){
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 1
+      }else{
+          MalNumerator_MultipleTests$uniqueIfx[originalIndex] <- 0}
+    }
+  }
+}
+
+MalNumerator_MultipleTests <- MalNumerator_MultipleTests %>% filter(uniqueIfx==1)
+
+# Append to the list of people who were only tested once
+MalNumerator_SingleTests <- Malaria %>% filter(test_result!="Negative" & 
+                                               test_result!="Not Detected") %>% 
+                                       group_by(patid) %>%
+                                       filter(n()==1) %>%
+                                       mutate(uniqueIfx=1) 
+MalNumerator <- rbind(MalNumerator_MultipleTests, MalNumerator_SingleTests)
+
+MalNumerator %>% group_by(login_year) %>% tally()
+
+#Get denominator by counting the number of distinct patients tested over the entire dataset
+MalDenominator <- n_distinct(Malaria$patid)
+```
+
+Pool diseases:
+```{r}
+PooledNumerator <- rbind(ChikNumerator, EntNumerator, DenNumerator, MalNumerator)
+PooledNumerator %>% group_by(login_year) %>% tally()
+
+ArbovirusNumerator <- rbind(ChikNumerator, DenNumerator)
+ArbovirusNumerator %>% group_by(login_year) %>% tally()
+```
+
+Write to file
+```{r}
+write.csv(ChikNumerator,"PATH/Chik-Cleaned.csv")
+write.csv(EntNumerator,"PATH/Enteric-Cleaned.csv")
+write.csv(DenNumerator,"PATH/Dengue-Cleaned.csv")
+write.csv(MalNumerator,"PATH/Malaria-Cleaned.csv")
+write.csv(PooledNumerator,"PATH/Pooled-Cleaned.csv")
+write.csv(ArbovirusNumerator,"PATH/Arboviruses-Cleaned.csv")
+```
+
